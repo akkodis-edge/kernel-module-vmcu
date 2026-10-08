@@ -590,7 +590,8 @@ static int iio_read_raw(struct iio_dev *indio_dev, struct iio_chan_spec const *c
 		data &= SENSOR_ITEMP_MASK;
 		if (sign_bit)
 			data = -data;
-		*val = data;
+		/* from celsius to millicelsius */
+		*val = data * 1000;
 		return IIO_VAL_INT;
 	case IIO_CHAN_INFO_SCALE:
 		*val = ADC_REF_mV;
