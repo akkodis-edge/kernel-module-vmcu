@@ -390,6 +390,7 @@ static int led_blink(struct led_classdev *cdev, unsigned long *delay_on, unsigne
 							| (((*delay_on / 100) << LED_ON_TIME_SHIFT) & LED_ON_TIME_MASK)
 							| (((*delay_off / 100) << LED_OFF_TIME_SHIFT) & LED_OFF_TIME_MASK))
 							<< vled->shift;
+
 	const uint32_t mask = (LED_BLINK_MASK | LED_ON_TIME_MASK | LED_OFF_TIME_MASK)
 							<< vled->shift;
 
@@ -502,12 +503,30 @@ static int led_register(struct vmcu* vmcu)
 		vmcu->led[reg].led_cdev.max_brightness = 1;
 		vmcu->led[reg].led_cdev.brightness_set_blocking = led_set_blocking;
 		vmcu->led[reg].led_cdev.blink_set = led_blink;
+		/* get requested default state */
+		const int default_state = led_init_default_state_get(child);
+		switch (default_state) {
+		case LEDS_DEFSTATE_ON:
+			vmcu->led[reg].led_cdev.brightness = 1;
+			break;
+		case LEDS_DEFSTATE_KEEP:
+			dev_warn(&vmcu->client->dev, "Node %s default-state = \"keep\" not supported\n", fwnode_get_name(child));
+			fallthrough;
+		case LEDS_DEFSTATE_OFF:
+			break;
+		}
 
 		r = devm_led_classdev_multicolor_register_ext(&vmcu->client->dev, &vmcu->led[reg], &init_data);
 		if (r < 0) {
 			dev_err(&vmcu->client->dev, "Failed registering %s\n", fwnode_get_name(child));
 			return r;
 		}
+
+		/* set default state */
+		const int default_brightness = default_state == LEDS_DEFSTATE_ON ? 1 : 0;
+		r = led_set_blocking(&vmcu->led[reg].led_cdev, default_brightness);
+		if (r < 0)
+			dev_warn(&vmcu->client->dev, "failed setting led%d default state to %d\n", reg, default_brightness);
 	}
 
 	return 0;
