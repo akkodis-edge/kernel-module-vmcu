@@ -188,6 +188,18 @@
 #define APPCTRL_ALIGNMENT_SHIFT	24
 #define APPWRITE_REG			0x75
 #define APPREAD_REG				0x76
+#define ERRCTRL_REG				0x80
+#define ERRCTRL_TYPE_MASK		GENMASK(2, 0)
+#define ERRCTRL_TYPE_HARDFAULT	BIT(0)
+#define ERRCTRL_TYPE_NMI		BIT(1)
+#define ERRCTRL_TYPE_CHECKPOINT	GENMASK(1, 0)
+#define ERRCTRL_LOC_MASK		GENMASK(4, 3)
+#define ERRCTRL_LOC_BOOTLOADER	BIT(3)
+#define ERRCTRL_LOC_APP_A		BIT(4)
+#define ERRCTRL_LOC_APP_B		GENMASK(4, 3)
+#define ERRCTRL_CLEAR			BIT(31)
+#define ERRMSG0_REG				0x81
+#define ERRMSG1_REG				0x82
 #define FACTORY_REG				0xf0
 #define FACTORY_POWER_OVERRIDE_MASK BIT(0)
 
@@ -199,6 +211,7 @@ static const struct regmap_range volatile_ranges[] = {
 	regmap_reg_range(GPIO0_REG, GPIO0_REG),
 	regmap_reg_range(GPIO1_REG, GPIO1_REG),
 	regmap_reg_range(APPCTRL_REG, APPCTRL_REG),
+	regmap_reg_range(ERRCTRL_REG, ERRMSG1_REG),
 	regmap_reg_range(FACTORY_REG, FACTORY_REG),
 };
 
@@ -1405,6 +1418,9 @@ static ssize_t store_value(struct device* dev, struct device_attribute* attr, co
 static ssize_t store_factory(struct device* dev, struct device_attribute* attr, const char* buf, size_t count);
 static ssize_t show_imu_wake_filter(struct device* dev, struct device_attribute* attr, char* buf);
 static ssize_t store_imu_wake_filter(struct device* dev, struct device_attribute* attr, const char* buf, size_t count);
+static ssize_t show_error(struct device* dev, struct device_attribute* attr, char* buf);
+static ssize_t store_error(struct device* dev, struct device_attribute* attr, const char* buf, size_t count);
+
 
 static DEVICE_ATTR(firmware_version, 0444, show_version, NULL);
 static DEVICE_ATTR(gpo1_mode, 0664, show_gpomode, store_gpomode);
@@ -1438,6 +1454,7 @@ static DEVICE_ATTR(imu_wake_odr, 0644, show_value, store_value);
 static DEVICE_ATTR(imu_wake_scale, 0644, show_value, store_value);
 static DEVICE_ATTR(imu_wake_thresh, 0644, show_value, store_value);
 static DEVICE_ATTR(imu_wake_duration, 0644, show_value, store_value);
+static DEVICE_ATTR(errorlog, 0644, show_error, store_error);
 
 static struct attribute *vmcu_attrs[] = {
 	&dev_attr_firmware_version.attr,
@@ -1472,6 +1489,7 @@ static struct attribute *vmcu_attrs[] = {
 	&dev_attr_imu_wake_scale.attr,
 	&dev_attr_imu_wake_thresh.attr,
 	&dev_attr_imu_wake_duration.attr,
+	&dev_attr_errorlog.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(vmcu);
@@ -1981,6 +1999,101 @@ static ssize_t store_imu_wake_filter(struct device* dev, struct device_attribute
 
 	r = regmap_update_bits(vmcu->regmap, IMUCTRL_REG,
 				IMUCTRL_FILTER_MASK, val);
+	mutex_unlock(&vmcu->mtx);
+	if (r < 0)
+		return r;
+
+	return count;
+}
+
+#define ERRCTRL_REG				0x80
+#define ERRCTRL_TYPE_MASK		GENMASK(2, 0)
+#define ERRCTRL_TYPE_HARDFAULT	BIT(0)
+#define ERRCTRL_TYPE_NMI		BIT(1)
+#define ERRCTRL_TYPE_CHECKPOINT	GENMASK(1, 0)
+#define ERRCTRL_LOC_MASK		GENMASK(4, 3)
+#define ERRCTRL_LOC_BOOTLOADER	BIT(3)
+#define ERRCTRL_LOC_APP_A		BIT(4)
+#define ERRCTRL_LOC_APP_B		GENMASK(4, 3)
+
+static const char* errlocation_str(u32 value)
+{
+	switch (value & ERRCTRL_LOC_MASK) {
+	case ERRCTRL_LOC_BOOTLOADER:
+		return "BOOTLOADER";
+	case ERRCTRL_LOC_APP_A:
+		return "APP_A";
+	case ERRCTRL_LOC_APP_B:
+		return "APP_B";
+	}
+	return "NONE";
+}
+
+static ssize_t show_error(struct device* dev, struct device_attribute* attr, char* buf)
+{
+	struct vmcu *vmcu = dev_get_drvdata(dev);
+	u32 errctrl = 0;
+	u32 msg0 = 0;
+	u32 msg1 = 0;
+	int r = 0;
+
+	/* Not supported before 1.4.0 */
+	if (!is_version_ge(&vmcu->version, 1, 4, 0))
+		return -ENOTSUPP;
+
+	r = mutex_lock_interruptible(&vmcu->mtx);
+	if (r)
+		return r;
+
+	r = regmap_read(vmcu->regmap, ERRCTRL_REG, &errctrl);
+	if (r == 0 && (errctrl & ERRCTRL_TYPE_MASK) != 0) {
+		if (r == 0)
+			r = regmap_read(vmcu->regmap, ERRMSG0_REG, &msg0);
+		if (r == 0)
+			r = regmap_read(vmcu->regmap, ERRMSG1_REG, &msg1);
+	}
+	mutex_unlock(&vmcu->mtx);
+	if (r < 0)
+		return r;
+
+	switch (errctrl & ERRCTRL_TYPE_MASK) {
+	case 0:
+		return sprintf(buf, "none\n");
+	case ERRCTRL_TYPE_HARDFAULT:
+		return sprintf(buf, "HARDFAULT [%s] pc: 0x%x: msg[1]: 0x%x\n", errlocation_str(errctrl), msg0, msg1);
+	case ERRCTRL_TYPE_NMI:
+		return sprintf(buf, "NMI [%s] pc: 0x%x: msg[1]: 0x%x\n", errlocation_str(errctrl), msg0, msg1);
+	case ERRCTRL_TYPE_CHECKPOINT:
+		return sprintf(buf, "CHECKPOINT [%s] pc: 0x%x: cp: %d: cp_irq: %d\n", errlocation_str(errctrl), msg0,
+				msg1 & 0xffff, (msg1 >> 16) & 0xffff);
+	default:
+		return sprintf(buf, "UNKNOWN (%u) [%s] msg[0]: 0x%x: msg[1]: 0x%x\n", errctrl & ERRCTRL_TYPE_MASK,
+				errlocation_str(errctrl), msg0, msg1);
+	}
+}
+
+static const char* STORE_ERROR_CLEAR = "clear";
+
+static ssize_t store_error(struct device* dev, struct device_attribute* attr, const char* buf, size_t count)
+{
+	struct vmcu *vmcu = dev_get_drvdata(dev);
+	u32 val = 0;
+	int r = 0;
+
+	/* Not supported before 1.4.0 */
+	if (!is_version_ge(&vmcu->version, 1, 4, 0))
+		return -ENOTSUPP;
+
+	if (strncmp(buf, STORE_ERROR_CLEAR, strlen(STORE_ERROR_CLEAR)) == 0)
+		val |= ERRCTRL_CLEAR;
+	else
+		return -EINVAL;
+
+	r = mutex_lock_interruptible(&vmcu->mtx);
+	if (r)
+		return r;
+
+	r = regmap_write(vmcu->regmap, ERRCTRL_REG, val);
 	mutex_unlock(&vmcu->mtx);
 	if (r < 0)
 		return r;
