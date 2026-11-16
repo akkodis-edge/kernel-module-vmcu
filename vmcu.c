@@ -2255,4 +2255,4 @@ module_i2c_driver(vmcu_driver);
 MODULE_AUTHOR("Mikko Salomaki <mikko.salomaki@akkodis.com>");
 MODULE_DESCRIPTION("Vehicle MCU driver");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("1.11");
+MODULE_VERSION("1.12");
