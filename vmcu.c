@@ -2217,7 +2217,7 @@ static ssize_t show_error(struct device* dev, struct device_attribute* attr, cha
 		return sprintf(buf, "CHECKPOINT [%s] pc: 0x%x: cp: %d: cp_irq: %d\n", errlocation_str(errctrl), msg0,
 				msg1 & 0xffff, (msg1 >> 16) & 0xffff);
 	default:
-		return sprintf(buf, "UNKNOWN (%u) [%s] msg[0]: 0x%x: msg[1]: 0x%x\n", errctrl & ERRCTRL_TYPE_MASK,
+		return sprintf(buf, "UNKNOWN (%u) [%s] msg[0]: 0x%x: msg[1]: 0x%x\n", (u32) (errctrl & ERRCTRL_TYPE_MASK),
 				errlocation_str(errctrl), msg0, msg1);
 	}
 }
