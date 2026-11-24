@@ -34,6 +34,7 @@
 #include <linux/firmware.h>
 #include <linux/of_irq.h>
 #include <linux/sysrq.h>
+#include <linux/power_supply.h>
 
 #define MAGIC_REG				0x0
 #define MAGIC_VALUE				0x0ec70add
@@ -172,6 +173,19 @@
 #define IMUWAKE1_THRESH_MASK		GENMASK(5,0)
 #define IMUWAKE1_DURATION_MASK		GENMASK(17, 16)
 #define IMUWAKE1_DURATION_SHIFT		16
+#define BATTSTATUS0_REG				0x60
+#define BATTSTATUS1_REG				0x65
+#define BATTSTATUS_TEMP_MASK		GENMASK(15, 0)
+#define BATTSTATUS_RSOC_MASK		GENMASK(22, 16)
+#define BATTSTATUS_RSOC_SHIFT		16
+#define BATTSTATUS_SUPPORTED_MASK	BIT(23)
+#define BATTSTATUS_PRESENT_MASK		BIT(24)
+#define BATTCHARGE0_REG				0x61
+#define BATTCHARGE1_REG				0x66
+#define BATTCHARGE_VOLTAGE_MASK		GENMASK(15, 0)
+#define BATTCHARGE_CURRENT_MASK		GENMASK(30, 16)
+#define BATTCHARGE_CURRENT_SHIFT	16
+#define BATTCHARGE_CURRENT_SIGN		BIT(31)
 #define APPCTRL_REG				0x70
 #define APPCTRL_PARTITION_MASK	BIT(0)
 #define APPCTRL_A_VALID_MASK	BIT(1)
@@ -203,6 +217,7 @@
 #define FACTORY_REG				0xf0
 #define FACTORY_POWER_OVERRIDE_MASK BIT(0)
 
+
 static const struct regmap_range volatile_ranges[] = {
 	regmap_reg_range(RTC_TIME_REG, RTC_DATE_REG),
 	regmap_reg_range(SENSOR_REG, SENSOR_REG),
@@ -211,6 +226,7 @@ static const struct regmap_range volatile_ranges[] = {
 	regmap_reg_range(GPIO0_REG, GPIO0_REG),
 	regmap_reg_range(GPIO1_REG, GPIO1_REG),
 	regmap_reg_range(APPCTRL_REG, APPCTRL_REG),
+	regmap_reg_range(BATTSTATUS0_REG, BATTCHARGE1_REG),
 	regmap_reg_range(ERRCTRL_REG, ERRMSG1_REG),
 	regmap_reg_range(FACTORY_REG, FACTORY_REG),
 };
@@ -231,6 +247,7 @@ static const struct regmap_config vmcu_regmap_config = {
 #define LED_NUM 18
 #define LED_NUM_COLORS	2
 #define ADC_REF_mV 		3300
+#define BATTERY_NUM 2
 
 enum vmcu_fw_part {
 	PART_A,
@@ -271,6 +288,7 @@ struct vmcu {
 	struct vmcu_fw			fw;
 	struct device			*root_dev;
 	struct vmcu_version		version;
+	struct power_supply		*battery[BATTERY_NUM];
 };
 
 static int rtc_set(struct device *dev, struct rtc_time *rtctime)
@@ -1405,6 +1423,138 @@ static int firmware_register(struct vmcu* vmcu)
 	return 0;
 }
 
+struct vmcu_battery {
+	struct vmcu *vmcu;
+	unsigned int status_reg;
+	unsigned int charge_reg;
+};
+
+static const enum power_supply_property vmcu_battery_props[] = {
+	POWER_SUPPLY_PROP_PRESENT,
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_TEMP,
+	POWER_SUPPLY_PROP_CAPACITY,
+};
+
+static const unsigned battery_status_reg[BATTERY_NUM] = {BATTSTATUS0_REG, BATTSTATUS1_REG};
+static const unsigned battery_charge_reg[BATTERY_NUM] = {BATTCHARGE0_REG, BATTCHARGE1_REG};
+
+static int vmcu_battery_get_property(struct power_supply *psy, enum power_supply_property psp, union power_supply_propval *val)
+{
+	struct vmcu_battery *vbat = power_supply_get_drvdata(psy);
+	unsigned int status_value = 0;
+	unsigned int charge_value = 0;
+	int r = 0;
+
+	r = mutex_lock_interruptible(&vbat->vmcu->mtx);
+	if (r)
+		return r;
+	r = regmap_read(vbat->vmcu->regmap, vbat->status_reg, &status_value);
+	if (r == 0)
+		r = regmap_read(vbat->vmcu->regmap, vbat->charge_reg, &charge_value);
+	mutex_unlock(&vbat->vmcu->mtx);
+	if (r != 0)
+		return r;
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_PRESENT:
+		val->intval = (status_value & BATTSTATUS_PRESENT_MASK) == BATTSTATUS_PRESENT_MASK;
+		break;
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+		val->intval = (charge_value & BATTCHARGE_VOLTAGE_MASK) * 1000; /* uV */
+		break;
+	case POWER_SUPPLY_PROP_CURRENT_NOW:
+		val->intval = ((charge_value & BATTCHARGE_CURRENT_MASK) >> BATTCHARGE_CURRENT_SHIFT) * 1000; /* uA */
+		if ((charge_value & BATTCHARGE_CURRENT_SIGN) == BATTCHARGE_CURRENT_SIGN)
+			val->intval = -val->intval;
+		break;
+	case POWER_SUPPLY_PROP_TEMP:
+		val->intval = (status_value & BATTSTATUS_TEMP_MASK) - 2731; /* deciC*/
+		break;
+	case POWER_SUPPLY_PROP_CAPACITY:
+		val->intval = (status_value & BATTSTATUS_RSOC_MASK) >> BATTSTATUS_RSOC_SHIFT; /* percent */
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int battery_register(struct vmcu* vmcu)
+{
+	struct power_supply_config psy_cfg;
+	struct power_supply_desc *psy_desc = NULL;
+	struct vmcu_battery *vbat = NULL;
+	const char *battery_names[BATTERY_NUM];
+	int r = 0;
+	int count = 0;
+	unsigned int status_value = 0;
+
+	count = device_property_string_array_count(&vmcu->client->dev, "battery-names");
+	if (count < 1)
+		return 0;
+	if (count > BATTERY_NUM) {
+		dev_err(&vmcu->client->dev, "defined too many battery-names, max %d allowed", BATTERY_NUM);
+		return -EINVAL;
+	}
+
+	r = device_property_read_string_array(&vmcu->client->dev, "battery-names", battery_names, count);
+	if (r != count) {
+		dev_err(&vmcu->client->dev, "failed reading battery-names: %d", r);
+		return -EINVAL;
+	}
+
+	for (int i = 0; i < count; ++i) {
+		/* skip empty strings */
+		if (battery_names[i] == NULL || battery_names[i][0] == '\0')
+			continue;
+
+		/* Confirm support if hardware */
+		r = mutex_lock_interruptible(&vmcu->mtx);
+		if (r == 0)
+			r = regmap_read(vmcu->regmap, battery_status_reg[i], &status_value);
+		mutex_unlock(&vmcu->mtx);
+		if (r != 0) {
+			dev_warn(&vmcu->client->dev, "battery%d \"%s\" failed read: %d", i, battery_names[i], r);
+			continue;
+		}
+		if ((status_value & BATTSTATUS_SUPPORTED_MASK) == 0) {
+			dev_warn(&vmcu->client->dev, "battery%d \"%s\" not supported by hardware", i, battery_names[i]);
+			continue;
+		}
+
+		/* register */
+		vbat = devm_kzalloc(&vmcu->client->dev, sizeof(*vbat), GFP_KERNEL);
+		if (vbat == NULL)
+			return -ENOMEM;
+		vbat->vmcu = vmcu;
+		vbat->status_reg = battery_status_reg[i];
+		vbat->charge_reg = battery_charge_reg[i];
+		psy_cfg.drv_data = vbat;
+		psy_cfg.fwnode = dev_fwnode(&vmcu->client->dev);
+		psy_cfg.no_wakeup_source = 1;
+
+		psy_desc = devm_kzalloc(&vmcu->client->dev, sizeof(*psy_desc), GFP_KERNEL);
+		if (psy_desc == NULL)
+			return -ENOMEM;
+		psy_desc->name = battery_names[i];
+		psy_desc->type = POWER_SUPPLY_TYPE_BATTERY;
+		psy_desc->properties = vmcu_battery_props;
+		psy_desc->num_properties = ARRAY_SIZE(vmcu_battery_props);
+		psy_desc->get_property = vmcu_battery_get_property;
+
+		vmcu->battery[i] = devm_power_supply_register(&vmcu->client->dev, psy_desc, &psy_cfg);
+		if (IS_ERR(vmcu->battery[i])) {
+			dev_err(&vmcu->client->dev, "Failed registering battery%d \"%s\" [%ld]\n", i, battery_names[i], PTR_ERR(vmcu->battery[i]));
+			return PTR_ERR(vmcu->battery[i]);
+		}
+	}
+
+	return 0;
+}
+
 static ssize_t show_version(struct device* dev, struct device_attribute* attr, char* buf);
 static ssize_t show_gpomode(struct device* dev, struct device_attribute* attr, char* buf);
 static ssize_t store_gpomode(struct device* dev, struct device_attribute* attr, const char* buf, size_t count);
@@ -2188,6 +2338,10 @@ static int vmcu_probe(struct i2c_client* client)
 
 	// firmware
 	firmware_register(vmcu);
+
+	// battery monitoring since 1.4.0 */
+	if (is_version_ge(&vmcu->version, 1, 4, 0))
+		battery_register(vmcu);
 
 	// interrupts
 	r = of_irq_get_byname(client->dev.of_node, "shutdown");
